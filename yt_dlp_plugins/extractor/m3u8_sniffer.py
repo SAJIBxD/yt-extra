@@ -1,3 +1,8 @@
+import os
+
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+CHROMIUM_PATH = "/data/data/com.termux/files/usr/bin/chromium-browser"
+
 class M3U8SnifferError(RuntimeError):
     pass
 
@@ -11,12 +16,16 @@ def get_m3u8_url_and_headers(page_url, timeout_ms=20000, headless=True):
     except ImportError as e:
         raise M3U8SnifferError(
             "Playwright is required. Install with:\n"
-            "  pipx inject yt-dlp playwright\n"
-            "  playwright install chromium"
+            "  pkg install tur-repo\n"
+            "  pkg install python-playwright"
         ) from e
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        browser = p.chromium.launch(
+            executable_path=CHROMIUM_PATH,
+            headless=headless,
+            args=['--no-sandbox', '--disable-gpu']
+        )
         page = browser.new_page()
 
         try:
