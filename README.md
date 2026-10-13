@@ -13,19 +13,18 @@ Requires yt-dlp `2025.12.08` or above.
 
 ### Manual install (recommended — works with any yt-dlp, incl. brew/standalone)
 
-Copy the `yt_dlp_plugins` directory from this repo into yt-dlp's plugin
-folder, so the final layout is
-`<plugins>/yt_dlp_plugins/extractor/*.py`. The plugin folder is:
+Clone this repo inside yt-dlp's plugin folder, so the final layout is
+`<plugins>/yt-extra/yt_dlp_plugins/extractor/*.py` (the extra folder level
+matters). The plugin folder is:
 
-- Linux: `~/.config/yt-dlp/plugins/`
-- macOS: `~/Library/Application Support/yt-dlp/plugins/`
+- Linux/macOS: `~/.config/yt-dlp/plugins/` (or `$XDG_CONFIG_HOME/yt-dlp/plugins/`)
 - Windows: `%APPDATA%\yt-dlp\plugins\`
+- Fallback on any OS: `~/.yt-dlp/plugins/`
 
 ```sh
-git clone https://github.com/SAJIBxD/yt-extra
-# Linux example:
+# Linux/macOS example:
 mkdir -p ~/.config/yt-dlp/plugins
-cp -r yt-extra/yt_dlp_plugins ~/.config/yt-dlp/plugins/
+git clone https://github.com/SAJIBxD/yt-extra ~/.config/yt-dlp/plugins/yt-extra
 ```
 
 ### Via pip (only if yt-dlp was installed with pip/pipx in the same environment)
