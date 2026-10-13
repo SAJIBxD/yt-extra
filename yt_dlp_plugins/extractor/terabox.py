@@ -2,6 +2,7 @@ import random
 import re
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 from yt_dlp.extractor.common import InfoExtractor
 from yt_dlp.utils import ExtractorError
@@ -24,10 +25,17 @@ class TeraBoxIE(InfoExtractor):
     _CHUNK_IDX_RE = re.compile(r'_(\d+)_ts/')
 
     # How many playlist polls per quality when discovering HLS chunks.
-    # The streaming endpoint returns a RANDOM subset per call, so we poll
-    # until the chunk set looks complete (contiguous + quiet streak).
-    _MAX_DISCOVERY_REQUESTS = 60
-    _DISCOVERY_QUIET_STREAK = 10
+    # The streaming endpoint returns a small RANDOM sliding window per call
+    # (verified: 3 segments; small chunks surface in only ~10% of polls),
+    # so we poll concurrently until the chunk set looks complete
+    # (contiguous from the start + quiet batches with no new chunk anywhere).
+    # Extraction (and `-F`) blocks on this, hence concurrent polls instead
+    # of sequential sleeps. Big shares stop at the budget with a partial
+    # warning.
+    _DISCOVERY_WORKERS = 5
+    _DISCOVERY_MAX_POLLS = 30
+    _DISCOVERY_MIN_POLLS = 15
+    _DISCOVERY_QUIET_BATCHES = 2
 
     # -- helpers -----------------------------------------------------------
 
@@ -93,33 +101,45 @@ class TeraBoxIE(InfoExtractor):
             return []
         return self._parse_playlist_text(text)
 
-    def _discover_chunks(self, shareid, uk, sign, timestamp, fs_id, quality, surl, referer):
+    def _discover_chunks(self, shareid, uk, sign, timestamp, fs_id, quality, surl, referer,
+                         seed=()):
+        # `seed` is the probe playlist response, so its chunks count without
+        # spending another request.
         known = {}
-        reqs = 0
-        no_new_streak = 0
-        max_idx = -1
-        max_requests = self._MAX_DISCOVERY_REQUESTS
-        while True:
-            reqs += 1
-            for item in self._query_playlist(
-                    shareid, uk, sign, timestamp, fs_id, quality, surl, referer):
-                known.setdefault(item[0], item)
-            cur_max = max(known) if known else -1
-            if cur_max > max_idx:
-                max_idx, no_new_streak = cur_max, 0
-            else:
-                no_new_streak += 1
+        for item in seed:
+            known.setdefault(item[0], item)
 
-            if known and min(known) <= 1 and len(known) == max(known) - min(known) + 1:
-                if no_new_streak >= self._DISCOVERY_QUIET_STREAK:
+        workers = self._DISCOVERY_WORKERS
+        max_polls = self._DISCOVERY_MAX_POLLS
+        polls = 0
+        quiet_batches = 0
+        args = (shareid, uk, sign, timestamp, fs_id, quality, surl, referer)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            while polls < max_polls:
+                batch = [ex.submit(self._safe_query_playlist, *args)
+                         for _ in range(workers)]
+                new = False
+                for fut in batch:
+                    for item in fut.result():
+                        if item[0] not in known:
+                            known[item[0]] = item
+                            new = True
+                polls += workers
+                quiet_batches = 0 if new else quiet_batches + 1
+                if (polls >= self._DISCOVERY_MIN_POLLS
+                        and quiet_batches >= self._DISCOVERY_QUIET_BATCHES
+                        and known and min(known) <= 1
+                        and len(known) == max(known) - min(known) + 1):
                     break
-            budget = min(max_requests, max(30, max_idx * 3)) if max_idx > 0 else 30
-            if reqs >= budget:
-                break
-            time.sleep(random.uniform(0.1, 0.25))
         if not known:
             return []
         return [known[i] for i in sorted(known)]
+
+    def _safe_query_playlist(self, *args):
+        try:
+            return self._query_playlist(*args)
+        except Exception:  # noqa: BLE001 - a failed poll just yields nothing
+            return []
 
     @staticmethod
     def _build_manifest(chunks):
@@ -195,24 +215,34 @@ class TeraBoxIE(InfoExtractor):
                 fmt['filesize'] = size
             formats.append(fmt)
 
-        # HLS for videos (360p/480p, no login needed).
+        # HLS for videos (360p/480p, no login needed). Both qualities are
+        # discovered concurrently since each blocks on polling.
         if is_video:
-            for qlabel, height in (('M3U8_AUTO_480', 480), ('M3U8_AUTO_360', 360)):
+            wanted = (('M3U8_AUTO_480', 480), ('M3U8_AUTO_360', 360))
+            probed = []
+            for qlabel, height in wanted:
                 probe = self._query_playlist(shareid, uk, sign, timestamp,
                                              fs_id, qlabel, surl, referer)
-                if not probe:
-                    continue
-                self.to_screen(f'{fs_id}: discovering {qlabel} chunks...')
-                chunks = self._discover_chunks(shareid, uk, sign, timestamp,
-                                               fs_id, qlabel, surl, referer)
+                if probe:
+                    probed.append((qlabel, height, probe))
+            with ThreadPoolExecutor(max_workers=len(probed) or 1) as ex:
+                futs = {
+                    ex.submit(self._discover_chunks, shareid, uk, sign,
+                              timestamp, fs_id, qlabel, surl, referer,
+                              seed=probe): (qlabel, height)
+                    for qlabel, height, probe in probed
+                }
+                found = [(qh[0], qh[1], fut.result()) for fut, qh in futs.items()]
+            for qlabel, height, chunks in sorted(found):
                 if not chunks:
                     continue
                 lo, hi = min(c[0] for c in chunks), max(c[0] for c in chunks)
-                if len(chunks) != hi - lo + 1:
+                if len(chunks) != hi - lo + 1 or lo > 1:
                     self.to_screen(
-                        f'{fs_id}: {qlabel} partial ({len(chunks)}/{hi - lo + 1} chunks)')
-                else:
-                    self.to_screen(f'{fs_id}: {qlabel} complete ({len(chunks)} chunks)')
+                        f'{fs_id}: {qlabel} partial ({len(chunks)} chunks, idx {lo}-{hi}); '
+                        'video may be truncated')
+                elif self._downloader and self._downloader.params.get('verbose'):
+                    self.to_screen(f'{fs_id}: {qlabel} complete ({len(chunks)} chunks, idx {lo}-{hi})')
                 manifest = self._build_manifest(chunks)
                 formats.append({
                     'format_id': f'hls-{height}p',
